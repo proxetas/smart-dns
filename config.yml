@@ -4,3 +4,6 @@ server:
 nameservers:
   - 1.1.1.1
   - 8.8.8.8
+queries:
+  recache_ttl: 290
+  upstream_strategy: parallel

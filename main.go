@@ -3,19 +3,23 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
-	"gopkg.in/yaml.v3"
 )
 
 type ResolveTask struct {
 	writer  dns.ResponseWriter
 	request *dns.Msg
 	config  *Config
+}
+
+type PingResult struct {
+	index   int
+	Latency int64
 }
 
 func write_response(writer dns.ResponseWriter, req *dns.Msg, answers []dns.RR, additional []dns.RR, authorative []dns.RR) {
@@ -29,55 +33,147 @@ func write_response(writer dns.ResponseWriter, req *dns.Msg, answers []dns.RR, a
 	writer.WriteMsg(msg)
 }
 
-func dns_resolver(tasks <-chan ResolveTask, hosts *Host, optimizedRecords *OptimizedRecords, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// Worker loop: Continuously receive tasks from the channel
+func dns_resolver(nameservers []string, req *dns.Msg) *chan *dns.Msg {
 	responses := make(chan *dns.Msg)
 	var subwg sync.WaitGroup
+	subwg.Add(len(nameservers) + 1)
+	for _, nameserver := range nameservers {
+		go func(resp chan *dns.Msg, req *dns.Msg, nameserver string, group *sync.WaitGroup) {
+			defer group.Done()
+			client := new(dns.Client)
+			//If not nameserver contains ":" then add ":53"
+			if !strings.Contains(nameserver, ":") {
+				nameserver += ":53"
+			}
+			result, _, err := client.Exchange(req, nameserver)
+			if err != nil {
+				resp <- nil
+			} else {
+				resp <- result
+			}
+		}(responses, req, nameserver, &subwg)
+	}
+
+	return &responses
+}
+
+type RecordWithLatency struct {
+	record  *dns.A
+	latency int64
+}
+
+func sort_by_latency(records []*dns.A, hosts *Host) []*dns.A {
+	var wg sync.WaitGroup
+	wg.Add(len(records) + 1)
+	result_chan := make(chan *RecordWithLatency)
+	results := []*RecordWithLatency{}
+
+	for _, record := range records {
+		go func(record *dns.A, result chan *RecordWithLatency, wg *sync.WaitGroup) {
+			defer wg.Done()
+			result <- &RecordWithLatency{latency: hosts.Get(record.A.String()), record: record}
+		}(record, result_chan, &wg)
+	}
+
+	for range records {
+		results = append(results, <-result_chan)
+	}
+
+	sort.Slice(results, func(i int, j int) bool {
+		return results[i].latency < results[j].latency
+	})
+
+	sorted := []*dns.A{}
+	for _, r := range results {
+		sorted = append(sorted, r.record)
+	}
+
+	return sorted
+}
+
+func try_send_optimized(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode) (bool, *CachedRecord) {
+	if len(req.Question) == 1 && req.Question[0].Qtype == dns.TypeA {
+		optimizedRecord := cache.GetOptimizedRecord(req.Question[0].Name)
+		if optimizedRecord != nil {
+			record := optimizedRecord.record
+			record.Header().Ttl = uint32(time.Until(optimizedRecord.expiration).Seconds())
+			answers := []dns.RR{optimizedRecord.record}
+			write_response(resp, req, answers, nil, nil)
+			if optimizedRecordA, ok := optimizedRecord.record.(*dns.A); ok {
+				fmt.Printf("Q from %s for %s -> optimized response %s sent\n", resp.RemoteAddr().String(), req.Question[0].Name, optimizedRecordA.A)
+			}
+			return true, optimizedRecord
+		}
+	}
+
+	return false, nil
+}
+
+func try_send_cached(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode) (bool, []CachedRecord) {
+	//note: although dns supports multiple questions, typically only one question is sent at a time
+	//so we only use the first question as source for the cache node
+	records := cache.GetRecords(req.Question[0].Qtype, req.Question[0].Name)
+
+	if len(records) > 0 {
+		rr_records := []dns.RR{}
+		for _, record := range records {
+			rr_records = append(rr_records, record.record)
+		}
+		write_response(resp, req, rr_records, nil, nil)
+		fmt.Printf("Q from %s for %s -> cached response sent\n", resp.RemoteAddr().String(), req.Question[0].Name)
+		return true, records
+	}
+
+	return false, nil
+}
+
+func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	for task := range tasks {
-		//if 1 question and of type A, check if we have optimized version
-		if len(task.request.Question) == 1 && task.request.Question[0].Qtype == dns.TypeA {
-			optimizedRecord := optimizedRecords.Get(task.request.Question[0].Name)
-			if !optimizedRecord.IsEmpty() {
-				answer, err := optimizedRecord.GetRR()
-				if err == nil {
-					answers := []dns.RR{answer}
-					write_response(task.writer, task.request, answers, nil, nil)
-					fmt.Printf("Q from %s for %s -> optimized response %s sent\n", task.writer.RemoteAddr().String(), task.request.Question[0].Name, optimizedRecord.IP)
-					continue
-				}
-			}
-		}
+		cache := root.GetCacheNode(task.request.Question[0].Name)
 
-		if !task.request.RecursionDesired {
-			dns.HandleFailed(task.writer, task.request)
+		sentOptimized, optimizedRecord := try_send_optimized(task.request, task.writer, cache)
+		if sentOptimized && optimizedRecord.expiration.Sub(time.Now()).Seconds() > float64(task.config.Queries.RecacheTTL) {
 			continue
 		}
 
-		subwg.Add(len(task.config.Nameservers))
-		for _, nameserver := range task.config.Nameservers {
-			go func(resp chan *dns.Msg, req *dns.Msg, nameserver string, group *sync.WaitGroup) {
-				defer group.Done()
-				client := new(dns.Client)
-				//If not nameserver contains ":" then add ":53"
-				if !strings.Contains(nameserver, ":") {
-					nameserver += ":53"
-				}
-				result, _, err := client.Exchange(req, nameserver)
-				if err != nil {
-					resp <- nil
-				} else {
-					resp <- result
-				}
-			}(responses, task.request, nameserver, &subwg)
+		sentCached := false
+		cachedRecords := []CachedRecord{}
+		if !sentOptimized {
+			sentCached, cachedRecords = try_send_cached(task.request, task.writer, cache)
 		}
 
-		first := <-responses
-		sentResponse := false
+		if sentCached {
+			needs_recache := false
+			for _, cachedRecord := range cachedRecords {
+				if cachedRecord.expiration.Sub(time.Now()).Seconds() < float64(task.config.Queries.RecacheTTL) {
+					needs_recache = true
+					break
+				}
+			}
 
-		if first != nil {
+			if !needs_recache {
+				continue
+			}
+		}
+
+		if !sentCached && !sentOptimized {
+			// we dont have cached records and recursion was denied -> fail
+			if !task.request.RecursionDesired {
+				//TODO: implement authorative/zone
+				dns.HandleFailed(task.writer, task.request)
+				continue
+			}
+		}
+
+		// send upstream
+		responses := *dns_resolver(task.config.Nameservers, task.request)
+		first := <-responses
+
+		sentResponse := sentOptimized || sentCached
+
+		if first != nil && !sentResponse {
 			sentResponse = true
 			task.writer.WriteMsg(first)
 			fmt.Printf("Q from %s for %s -> proxied response sent\n", task.writer.RemoteAddr().String(), task.request.Question[0].Name)
@@ -90,13 +186,30 @@ func dns_resolver(tasks <-chan ResolveTask, hosts *Host, optimizedRecords *Optim
 			results = append(results, <-responses)
 		}
 
-		if !sentResponse {
-			for _, response := range results {
-				if response != nil {
-					task.writer.WriteMsg(response)
+		fmt.Printf("optimizing %s...\n", task.request.Question[0].Name)
+		var ARecords []*dns.A
+
+		for _, result := range results {
+			if result != nil {
+				if !sentResponse {
+					task.writer.WriteMsg(result)
 					sentResponse = true
-					fmt.Printf("Q from %s for %s -> proxied response sent\n", task.writer.RemoteAddr().String(), task.request.Question[0].Name)
-					break
+					fmt.Printf("Q from %s for %s -> upstream response sent\n", task.writer.RemoteAddr().String(), task.request.Question[0].Name)
+				}
+
+				for _, answer := range result.Answer {
+					if a, ok := answer.(*dns.A); ok {
+						ARecords = append(ARecords, a)
+					}
+					cache.AddRecord(answer)
+				}
+
+				for _, ns := range result.Ns {
+					cache.AddRecord(ns)
+				}
+
+				for _, extra := range result.Extra {
+					cache.AddRecord(extra)
 				}
 			}
 		}
@@ -107,98 +220,24 @@ func dns_resolver(tasks <-chan ResolveTask, hosts *Host, optimizedRecords *Optim
 			continue
 		}
 
-		fmt.Printf("optimizing %s...\n", task.request.Question[0].Name)
-		var ARecordIPs []string
-		var ARecords []*dns.A
-
-		for _, result := range results {
-			for _, answer := range result.Answer {
-				if a, ok := answer.(*dns.A); ok {
-					ARecordIPs = append(ARecordIPs, a.A.String())
-					ARecords = append(ARecords, a)
+		skip_ping := false
+		if sentOptimized {
+			for _, a_record := range ARecords {
+				if RREquals(a_record, optimizedRecord.record) {
+					optimizedRecord.expiration = time.Now().Add(time.Duration(a_record.Header().Ttl) * time.Second)
+					fmt.Printf("extended expiration for optimized record %s -> %s\n", task.request.Question[0].Name, a_record.A)
+					skip_ping = true
+					break
 				}
 			}
 		}
 
-		type PingResult struct {
-			index   int
-			Latency int64
+		if !skip_ping {
+			fastSortedRecords := sort_by_latency(ARecords, hosts)
+			fmt.Printf("optimized record for %s -> %s\n", task.request.Question[0].Name, fastSortedRecords[0].A)
+			cache.SetOptimizedRecord(fastSortedRecords[0])
 		}
-
-		var latencies []PingResult
-		var latencyChannel = make(chan PingResult)
-
-		for i, ip := range ARecordIPs {
-			subwg.Add(1)
-			go func(wg *sync.WaitGroup, index int, ip string, result chan PingResult) {
-				defer wg.Done()
-				result <- PingResult{index: index, Latency: hosts.Get(ip)}
-			}(&subwg, i, ip, latencyChannel)
-		}
-
-		for i := 0; i < len(ARecordIPs); i++ {
-			latencies = append(latencies, <-latencyChannel)
-		}
-
-		var fastestLatency int64 = latencies[0].Latency
-		var fastestARecord *dns.A = ARecords[latencies[0].index]
-		var fastestIp string = ARecordIPs[latencies[0].index]
-
-		for _, latency := range latencies {
-			if latency.Latency < fastestLatency {
-				fastestIp = ARecordIPs[latency.index]
-				fastestLatency = latency.Latency
-				fastestARecord = ARecords[latency.index]
-			}
-		}
-
-		optimizedRecord := OptimizedA{
-			IP:         fastestIp,
-			Latency:    fastestLatency,
-			Name:       fastestARecord.Header().Name,
-			expiration: time.Now().Add(time.Second * time.Duration(fastestARecord.Hdr.Ttl)),
-		}
-
-		fmt.Printf("optimized record for %s -> %s %dms\n", task.request.Question[0].Name, fastestIp, fastestLatency/1000)
-		optimizedRecords.Set(fastestARecord.Header().Name, &optimizedRecord)
 	}
-}
-
-type Config struct {
-	Server struct {
-		Port    int    `yaml:"port"`
-		Address string `yaml:"address"`
-	} `yaml:"server"`
-	Nameservers []string `yaml:"nameservers"`
-}
-
-// loadConfig reads the config from the file and parses it into a Config struct
-func loadConfig() (*Config, error) {
-	// Path to the configuration file
-	configFile := "./config.yml"
-
-	// Check if the file exists
-	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		fmt.Printf("Error: Config file '%s' not found\n", configFile)
-		return nil, err
-	}
-
-	// Read the file contents
-	data, err := os.ReadFile(configFile)
-	if err != nil {
-		fmt.Printf("Error: Failed to read config file '%s': %v\n", configFile, err)
-		return nil, err
-	}
-
-	// Parse the YAML into the Config struct
-	var config Config
-	err = yaml.Unmarshal(data, &config)
-	if err != nil {
-		fmt.Printf("Error: Failed to parse config file '%s': %v\n", configFile, err)
-		return nil, err
-	}
-
-	return &config, nil
 }
 
 func main() {
@@ -212,11 +251,11 @@ func main() {
 	resolverTasks := make(chan ResolveTask)
 	var wg sync.WaitGroup
 	host := NewHost()
-	optimizedRecords := NewOptimizedRecords()
+	cache := NewDnsCacheNode(".")
 
 	//start 1 worker
 	wg.Add(1)
-	go dns_resolver(resolverTasks, host, optimizedRecords, &wg)
+	go request_worker(resolverTasks, host, cache, &wg)
 
 	// Create a new DNS server
 	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
