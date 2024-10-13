@@ -1,0 +1,3 @@
+#!/bin/bash
+
+GOOS=linux GOARCH=amd64 go build -o build/smart-dns_linux-amd64
