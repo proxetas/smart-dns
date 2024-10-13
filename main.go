@@ -28,6 +28,7 @@ func write_response(writer dns.ResponseWriter, req *dns.Msg, answers []dns.RR, a
 	writer.WriteMsg(msg)
 }
 
+// TODO: add upstream strategies: parallel, sequential, round-robin
 func dns_resolver(nameservers []string, req *dns.Msg) *chan *dns.Msg {
 	responses := make(chan *dns.Msg)
 	var subwg sync.WaitGroup
