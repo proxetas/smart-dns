@@ -17,11 +17,6 @@ type ResolveTask struct {
 	config  *Config
 }
 
-type PingResult struct {
-	index   int
-	Latency int64
-}
-
 func write_response(writer dns.ResponseWriter, req *dns.Msg, answers []dns.RR, additional []dns.RR, authorative []dns.RR) {
 	msg := new(dns.Msg)
 	msg.SetReply(req)
@@ -41,7 +36,6 @@ func dns_resolver(nameservers []string, req *dns.Msg) *chan *dns.Msg {
 		go func(resp chan *dns.Msg, req *dns.Msg, nameserver string, group *sync.WaitGroup) {
 			defer group.Done()
 			client := new(dns.Client)
-			//If not nameserver contains ":" then add ":53"
 			if !strings.Contains(nameserver, ":") {
 				nameserver += ":53"
 			}
@@ -134,7 +128,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 		cache := root.GetCacheNode(task.request.Question[0].Name)
 
 		sentOptimized, optimizedRecord := try_send_optimized(task.request, task.writer, cache)
-		if sentOptimized && optimizedRecord.expiration.Sub(time.Now()).Seconds() > float64(task.config.Queries.RecacheTTL) {
+		if sentOptimized && time.Until(optimizedRecord.expiration).Seconds() > float64(task.config.Queries.RecacheTTL) {
 			continue
 		}
 
@@ -147,7 +141,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 		if sentCached {
 			needs_recache := false
 			for _, cachedRecord := range cachedRecords {
-				if cachedRecord.expiration.Sub(time.Now()).Seconds() < float64(task.config.Queries.RecacheTTL) {
+				if time.Until(cachedRecord.expiration).Seconds() < float64(task.config.Queries.RecacheTTL) {
 					needs_recache = true
 					break
 				}
