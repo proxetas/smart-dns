@@ -57,10 +57,12 @@ func (d *DnsCacheNode) AddRecord(record dns.RR) {
 	if record.Header().Rrtype == dns.TypeOPT {
 		return
 	}
+	defer d.mutex.Unlock()
+	d.mutex.Lock()
 
+	ttl := record.Header().Ttl
 	record_name := record.Header().Name
 	if d.name == record_name {
-		ttl := record.Header().Ttl
 		for _, r := range d.records {
 			if RREquals(record, r.record) {
 				r.expiration = time.Now().Add(time.Duration(ttl) * time.Second)
@@ -68,20 +70,25 @@ func (d *DnsCacheNode) AddRecord(record dns.RR) {
 			}
 		}
 
-		d.mutex.Lock()
 		d.records = append(d.records, CachedRecord{
 			record:     record,
 			expiration: time.Now().Add(time.Duration(ttl) * time.Second),
 		})
-		d.mutex.Unlock()
-	} else if innerD, exists := d.cache[record_name]; exists {
-		innerD.AddRecord(record)
-	} else {
-		d.mutex.Lock()
-		d.cache[record_name] = NewDnsCacheNode(record_name)
-		d.mutex.Unlock()
-		d.cache[record_name].AddRecord(record)
 	}
+
+	innerD, exists := d.cache[record_name]
+	if exists {
+		innerD.AddRecord(record)
+		return
+	}
+
+	newCacheNode := NewDnsCacheNode(record_name)
+	newCacheNode.records = append(newCacheNode.records, CachedRecord{
+		record:     record,
+		expiration: time.Now().Add(time.Duration(ttl) * time.Second),
+	})
+
+	d.cache[record_name] = newCacheNode
 }
 
 func (d *DnsCacheNode) SetOptimizedRecord(record dns.RR) {
@@ -89,17 +96,30 @@ func (d *DnsCacheNode) SetOptimizedRecord(record dns.RR) {
 		d.mutex.Lock()
 		d.optimizedRecord = CachedRecord{record: record, expiration: time.Now().Add(time.Duration(record.Header().Ttl) * time.Second)}
 		d.mutex.Unlock()
-	} else if innerD, exists := d.cache[record.Header().Name]; exists {
-		innerD.SetOptimizedRecord(record)
-	} else {
-		d.mutex.Lock()
-		d.cache[record.Header().Name] = NewDnsCacheNode(record.Header().Name)
-		d.mutex.Unlock()
-		d.cache[record.Header().Name].SetOptimizedRecord(record)
+		return
 	}
+
+	d.mutex.Lock()
+	innerD, exists := d.cache[record.Header().Name]
+	d.mutex.Unlock()
+	if exists {
+		innerD.SetOptimizedRecord(record)
+		return
+	}
+
+	newNode := NewDnsCacheNode(record.Header().Name)
+	newNode.optimizedRecord = CachedRecord{record: record, expiration: time.Now().Add(time.Duration(record.Header().Ttl) * time.Second)}
+
+	d.mutex.Lock()
+	d.cache[record.Header().Name] = newNode
+	d.mutex.Unlock()
+
 }
 
 func (d *DnsCacheNode) GetOptimizedRecord(name string) *CachedRecord {
+	defer d.mutex.Unlock()
+	d.mutex.Lock()
+
 	if d.name == name {
 		if !d.optimizedRecord.Expired() {
 			return &d.optimizedRecord
@@ -114,6 +134,9 @@ func (d *DnsCacheNode) GetOptimizedRecord(name string) *CachedRecord {
 }
 
 func (d *DnsCacheNode) GetCacheNode(name string) *DnsCacheNode {
+	defer d.mutex.Unlock()
+	d.mutex.Lock()
+
 	if d.name == name {
 		return d
 	}
@@ -122,20 +145,15 @@ func (d *DnsCacheNode) GetCacheNode(name string) *DnsCacheNode {
 		return inner
 	}
 
-	defer d.mutex.Unlock()
-	d.mutex.Lock()
-
 	d.cache[name] = NewDnsCacheNode(name)
 	return d.cache[name]
 }
 
 func (d *DnsCacheNode) GetRecords(qtype uint16, qname string) []CachedRecord {
 	if d.name == qname {
-		if qtype == dns.TypeA && d.optimizedRecord != (CachedRecord{}) && !time.Now().After(d.optimizedRecord.expiration) {
-			return []CachedRecord{d.optimizedRecord}
-		}
 		expired := []int{}
 
+		defer d.mutex.Unlock()
 		d.mutex.Lock()
 		results := []CachedRecord{}
 		for i, r := range d.records {
@@ -146,7 +164,7 @@ func (d *DnsCacheNode) GetRecords(qtype uint16, qname string) []CachedRecord {
 
 			if r.record.Header().Rrtype == qtype {
 				record, err := dns.NewRR(r.record.String())
-				if err != nil {
+				if err == nil {
 					record.Header().Ttl = uint32(time.Until(r.expiration).Seconds())
 					results = append(results, CachedRecord{record: record, expiration: r.expiration})
 				}
@@ -158,7 +176,6 @@ func (d *DnsCacheNode) GetRecords(qtype uint16, qname string) []CachedRecord {
 			d.records = append(d.records[:i], d.records[i+1:]...)
 		}
 
-		d.mutex.Unlock()
 		return results
 	} else if innerD, exists := d.cache[qname]; exists {
 		return innerD.GetRecords(qtype, qname)
@@ -167,11 +184,16 @@ func (d *DnsCacheNode) GetRecords(qtype uint16, qname string) []CachedRecord {
 	return []CachedRecord{}
 }
 
+// func (d *DnsCacheNode) AnswerQuestion(question dns.Question) []dns.RR {
+
+// }
+
 func NewDnsCacheNode(name string) *DnsCacheNode {
 	return &DnsCacheNode{
 		cache:           make(map[string]*DnsCacheNode),
 		name:            name,
 		records:         []CachedRecord{},
 		optimizedRecord: CachedRecord{},
+		mutex:           sync.Mutex{},
 	}
 }

@@ -1,6 +1,6 @@
 server:
-  port: 5333
-  address: localhost
+  port: 53
+  address: 0.0.0.0
 nameservers:
   - 1.1.1.1
   - 8.8.8.8

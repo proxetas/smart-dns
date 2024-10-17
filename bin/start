@@ -1,0 +1,3 @@
+#!/bin/bash
+
+./smart-dns >> /var/log/smart-dns.log 2>&1

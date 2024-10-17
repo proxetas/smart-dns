@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -86,28 +87,63 @@ func sort_by_latency(records []*dns.A, hosts *Host) []*dns.A {
 	return sorted
 }
 
-func try_send_optimized(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode) (bool, *CachedRecord) {
+func try_send_optimized(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode, remoteIP string) (bool, *CachedRecord) {
 	if len(req.Question) == 1 && req.Question[0].Qtype == dns.TypeA {
-		optimizedRecord := cache.GetOptimizedRecord(req.Question[0].Name)
-		if optimizedRecord != nil {
-			record := optimizedRecord.record
-			record.Header().Ttl = uint32(time.Until(optimizedRecord.expiration).Seconds())
-			answers := []dns.RR{optimizedRecord.record}
-			write_response(resp, req, answers, nil, nil)
-			if optimizedRecordA, ok := optimizedRecord.record.(*dns.A); ok {
-				fmt.Printf("Q from %s for %s -> optimized response %s sent\n", resp.RemoteAddr().String(), req.Question[0].Name, optimizedRecordA.A)
+		cnames := cache.GetRecords(dns.TypeCNAME, req.Question[0].Name)
+
+		if len(cnames) > 0 {
+			answers := []dns.RR{cnames[0].record}
+			if cname, ok := cnames[0].record.(*dns.CNAME); ok {
+				cname_cache := cache.GetCacheNode(cname.Target)
+				optimized_record := cname_cache.GetOptimizedRecord(cname.Target)
+				if optimized_record != nil {
+					answers = append(answers, optimized_record.record)
+					write_response(resp, req, answers, nil, nil)
+					if optimizedRecordA, ok := optimized_record.record.(*dns.A); ok {
+						fmt.Printf("[%s] Q %s \t -> optimized response %s\n", remoteIP, req.Question[0].Name, optimizedRecordA.A)
+					}
+
+					return true, optimized_record
+				}
 			}
-			return true, optimizedRecord
+
+			return false, nil
+		}
+
+		optimized_record := cache.GetOptimizedRecord(req.Question[0].Name)
+		if optimized_record != nil {
+			record := optimized_record.record
+			record.Header().Ttl = uint32(time.Until(optimized_record.expiration).Seconds())
+			answers := []dns.RR{optimized_record.record}
+			write_response(resp, req, answers, nil, nil)
+			if optimizedRecordA, ok := optimized_record.record.(*dns.A); ok {
+				fmt.Printf("[%s] Q %s \t -> optimized response %s\n", remoteIP, req.Question[0].Name, optimizedRecordA.A)
+			}
+			return true, optimized_record
 		}
 	}
 
 	return false, nil
 }
 
-func try_send_cached(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode) (bool, []CachedRecord) {
+func try_send_cached(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode, remoteIP string) (bool, []CachedRecord) {
 	//note: although dns supports multiple questions, typically only one question is sent at a time
 	//so we only use the first question as source for the cache node
 	records := cache.GetRecords(req.Question[0].Qtype, req.Question[0].Name)
+
+	if req.Question[0].Qtype == dns.TypeA {
+		cnames := cache.GetRecords(dns.TypeCNAME, req.Question[0].Name)
+
+		if len(cnames) > 0 {
+			records = append(records, cnames[0])
+			cname, ok := cnames[0].record.(*dns.CNAME)
+			if ok {
+				alias_cache := cache.GetCacheNode(cname.Target)
+				alias_records := alias_cache.GetRecords(req.Question[0].Qtype, cname.Target)
+				records = append(records, alias_records...)
+			}
+		}
+	}
 
 	if len(records) > 0 {
 		rr_records := []dns.RR{}
@@ -115,11 +151,32 @@ func try_send_cached(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode)
 			rr_records = append(rr_records, record.record)
 		}
 		write_response(resp, req, rr_records, nil, nil)
-		fmt.Printf("Q from %s for %s -> cached response sent\n", resp.RemoteAddr().String(), req.Question[0].Name)
+		fmt.Printf("[%s] Q %s \t -> cached response sent\n", remoteIP, req.Question[0].Name)
 		return true, records
 	}
 
 	return false, nil
+}
+
+func getQTypeLabel(qtype uint16) string {
+	switch qtype {
+	case dns.TypeA:
+		return "A"
+	case dns.TypeAAAA:
+		return "AAAA"
+	case dns.TypeNS:
+		return "NS"
+	case dns.TypeMX:
+		return "MX"
+	case dns.TypeHTTPS:
+		return "HTTPS"
+	case dns.TypeEUI64:
+		return "EUI64"
+	case dns.TypePTR:
+		return "PTR"
+	default:
+		return "?" + fmt.Sprintf("%d", qtype)
+	}
 }
 
 func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, wg *sync.WaitGroup) {
@@ -127,8 +184,8 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 
 	for task := range tasks {
 		cache := root.GetCacheNode(task.request.Question[0].Name)
-
-		sentOptimized, optimizedRecord := try_send_optimized(task.request, task.writer, cache)
+		remoteIP := strings.Split(task.writer.RemoteAddr().String(), ":")[0]
+		sentOptimized, optimizedRecord := try_send_optimized(task.request, task.writer, cache, remoteIP)
 		if sentOptimized && time.Until(optimizedRecord.expiration).Seconds() > float64(task.config.Queries.RecacheTTL) {
 			continue
 		}
@@ -136,7 +193,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 		sentCached := false
 		cachedRecords := []CachedRecord{}
 		if !sentOptimized {
-			sentCached, cachedRecords = try_send_cached(task.request, task.writer, cache)
+			sentCached, cachedRecords = try_send_cached(task.request, task.writer, cache, remoteIP)
 		}
 
 		if sentCached {
@@ -171,7 +228,11 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 		if first != nil && !sentResponse {
 			sentResponse = true
 			task.writer.WriteMsg(first)
-			fmt.Printf("Q from %s for %s -> proxied response sent\n", task.writer.RemoteAddr().String(), task.request.Question[0].Name)
+			response_value := ""
+			if len(first.Answer) > 0 {
+				response_value = getRRValue(first.Answer[0])
+			}
+			fmt.Printf("[%s] Q [%s] %s \t -> proxied response sent %s\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name, response_value)
 		}
 
 		results := make([]*dns.Msg, 0, len(task.config.Nameservers)+1)
@@ -181,20 +242,20 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 			results = append(results, <-responses)
 		}
 
-		fmt.Printf("optimizing %s...\n", task.request.Question[0].Name)
-		var ARecords []*dns.A
+		ARecordMap := make(map[string]*dns.A)
 
 		for _, result := range results {
 			if result != nil {
 				if !sentResponse {
 					task.writer.WriteMsg(result)
 					sentResponse = true
-					fmt.Printf("Q from %s for %s -> upstream response sent\n", task.writer.RemoteAddr().String(), task.request.Question[0].Name)
+					fmt.Printf("[%s] Q [%s] %s \t -> proxied response sent\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name)
 				}
 
 				for _, answer := range result.Answer {
 					if a, ok := answer.(*dns.A); ok {
-						ARecords = append(ARecords, a)
+						key := fmt.Sprintf("%s%s", a.A.String(), a.Header().Name)
+						ARecordMap[key] = a
 					}
 					cache.AddRecord(answer)
 				}
@@ -211,16 +272,18 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 
 		if !sentResponse {
 			dns.HandleFailed(task.writer, task.request)
-			fmt.Printf("Q from %s for %s -> failed", task.writer.RemoteAddr().String(), task.request.Question[0].Name)
+			fmt.Printf("Q from %s for %s \t -> failed", remoteIP, task.request.Question[0].Name)
 			continue
 		}
-
+		var ARecords []*dns.A
+		for _, val := range ARecordMap {
+			ARecords = append(ARecords, val)
+		}
 		skip_ping := false
 		if sentOptimized {
 			for _, a_record := range ARecords {
 				if RREquals(a_record, optimizedRecord.record) {
 					optimizedRecord.expiration = time.Now().Add(time.Duration(a_record.Header().Ttl) * time.Second)
-					fmt.Printf("extended expiration for optimized record %s -> %s\n", task.request.Question[0].Name, a_record.A)
 					skip_ping = true
 					break
 				}
@@ -228,9 +291,10 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 		}
 
 		if !skip_ping {
-			fastSortedRecords := sort_by_latency(ARecords, hosts)
-			fmt.Printf("optimized record for %s -> %s\n", task.request.Question[0].Name, fastSortedRecords[0].A)
-			cache.SetOptimizedRecord(fastSortedRecords[0])
+			if len(ARecords) > 0 {
+				fastSortedRecords := sort_by_latency(ARecords, hosts)
+				cache.SetOptimizedRecord(fastSortedRecords[0])
+			}
 		}
 	}
 }
@@ -249,8 +313,14 @@ func main() {
 	cache := NewDnsCacheNode(".")
 
 	//start 1 worker
-	wg.Add(1)
-	go request_worker(resolverTasks, host, cache, &wg)
+	workers := runtime.NumCPU() * 2
+	// workers := 1
+	for range workers {
+		wg.Add(1)
+		go request_worker(resolverTasks, host, cache, &wg)
+	}
+
+	log.Printf("spawned %d workers", workers)
 
 	// Create a new DNS server
 	dns.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
@@ -259,13 +329,23 @@ func main() {
 
 	// Start listening for DNS requests on port 5353
 	addr := fmt.Sprintf("%s:%d", config.Server.Address, config.Server.Port)
-	server := &dns.Server{Addr: addr, Net: "udp"}
-	log.Printf("Starting DNS server on %s", addr)
+	go func() {
+		server := &dns.Server{Addr: addr, Net: "udp"}
+		defer server.Shutdown()
 
-	err = server.ListenAndServe()
-	defer server.Shutdown()
+		log.Printf("Starting DNS server on %s UDP", addr)
 
-	if err != nil {
-		log.Fatalf("Failed to start server: %s\n", err.Error())
-	}
+		err = server.ListenAndServe()
+	}()
+
+	go func() {
+		server := &dns.Server{Addr: addr, Net: "tcp"}
+		defer server.Shutdown()
+
+		log.Printf("Starting DNS server on %s TCP", addr)
+
+		err = server.ListenAndServe()
+	}()
+
+	select {}
 }

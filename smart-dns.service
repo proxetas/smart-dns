@@ -1,0 +1,11 @@
+[Unit]
+Description=Smart DNS
+
+[Service]
+ExecStart=/etc/smart-dns/start
+Restart=always
+Environment=PATH=/usr/bin:/usr/local/bin
+WorkingDirectory=/etc/smart-dns
+
+[Install]
+WantedBy=multi-user.target

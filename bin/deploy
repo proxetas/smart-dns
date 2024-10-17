@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# creates a dist.tar.gz which you can scp to a remote server to deploy to.
+# expected path (smart-dns.service) is /etc/smart-dns
+
+script_dir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+cd $script_dir/..
+
+if [ -f dist.tar.gz ]; then
+  rm dist.tar.gz
+fi
+
+mkdir -p dist
+
+./bin/build
+
+cp build/smart-dns_linux-amd64 dist/smart-dns
+cp config.yml dist/config.yml
+cp smart-dns.service dist/smart-dns.service
+cp bin/start dist/start
+
+tar -C dist -czvf dist.tar.gz .
+
+rm -rf dist/
