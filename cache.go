@@ -23,6 +23,8 @@ func getRRValue(rr dns.RR) string {
 		return fmt.Sprintf("%s %d", v.Mx, v.Preference)
 	case *dns.NS:
 		return v.Ns
+	case *dns.HTTPS:
+		return fmt.Sprintf("%s %d", v.Header().Name, v.Priority)
 	default:
 		return rr.Header().String()
 	}

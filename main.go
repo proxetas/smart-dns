@@ -100,7 +100,7 @@ func try_send_optimized(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNo
 					answers = append(answers, optimized_record.record)
 					write_response(resp, req, answers, nil, nil)
 					if optimizedRecordA, ok := optimized_record.record.(*dns.A); ok {
-						fmt.Printf("[%s] Q %s \t -> optimized response %s\n", remoteIP, req.Question[0].Name, optimizedRecordA.A)
+						fmt.Printf("[%s] Q [%s] %s \t\t -> optimized response sent %s\n", remoteIP, getQTypeLabel(req.Question[0].Qtype), req.Question[0].Name, optimizedRecordA.A)
 					}
 
 					return true, optimized_record
@@ -117,7 +117,7 @@ func try_send_optimized(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNo
 			answers := []dns.RR{optimized_record.record}
 			write_response(resp, req, answers, nil, nil)
 			if optimizedRecordA, ok := optimized_record.record.(*dns.A); ok {
-				fmt.Printf("[%s] Q %s \t -> optimized response %s\n", remoteIP, req.Question[0].Name, optimizedRecordA.A)
+				fmt.Printf("[%s] Q [%s] %s \t\t -> optimized response sent %s\n", remoteIP, getQTypeLabel(req.Question[0].Qtype), req.Question[0].Name, optimizedRecordA.A)
 			}
 			return true, optimized_record
 		}
@@ -151,7 +151,7 @@ func try_send_cached(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode,
 			rr_records = append(rr_records, record.record)
 		}
 		write_response(resp, req, rr_records, nil, nil)
-		fmt.Printf("[%s] Q %s \t -> cached response sent\n", remoteIP, req.Question[0].Name)
+		fmt.Printf("[%s] Q [%s] %s \t\t -> cached response sent\n", remoteIP, getQTypeLabel(req.Question[0].Qtype), req.Question[0].Name)
 		return true, records
 	}
 
@@ -232,7 +232,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 			if len(first.Answer) > 0 {
 				response_value = getRRValue(first.Answer[0])
 			}
-			fmt.Printf("[%s] Q [%s] %s \t -> proxied response sent %s\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name, response_value)
+			fmt.Printf("[%s] Q [%s] %s \t\t -> proxied response sent %s\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name, response_value)
 		}
 
 		results := make([]*dns.Msg, 0, len(task.config.Nameservers)+1)
@@ -249,7 +249,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 				if !sentResponse {
 					task.writer.WriteMsg(result)
 					sentResponse = true
-					fmt.Printf("[%s] Q [%s] %s \t -> proxied response sent\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name)
+					fmt.Printf("[%s] Q [%s] %s \t\t -> proxied response sent\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name)
 				}
 
 				for _, answer := range result.Answer {
