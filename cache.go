@@ -24,7 +24,7 @@ func getRRValue(rr dns.RR) string {
 	case *dns.NS:
 		return v.Ns
 	case *dns.HTTPS:
-		return fmt.Sprintf("%s %d", v.Header().Name, v.Priority)
+		return fmt.Sprintf("%s %d %s", v.Header().Name, v.Priority, v.Target)
 	default:
 		return rr.Header().String()
 	}
@@ -76,6 +76,7 @@ func (d *DnsCacheNode) AddRecord(record dns.RR) {
 			record:     record,
 			expiration: time.Now().Add(time.Duration(ttl) * time.Second),
 		})
+		return
 	}
 
 	innerD, exists := d.cache[record_name]

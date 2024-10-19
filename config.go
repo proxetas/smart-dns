@@ -12,7 +12,8 @@ type Config struct {
 		Port    int    `yaml:"port"`
 		Address string `yaml:"address"`
 	} `yaml:"server"`
-	Nameservers []string `yaml:"nameservers"`
+	Nameservers []string          `yaml:"nameservers"`
+	Addresses   map[string]string `yaml:"addresses"`
 	Queries     struct {
 		RecacheTTL int `yaml:"recache_ttl"`
 	}

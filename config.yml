@@ -4,6 +4,8 @@ server:
 nameservers:
   - 1.1.1.1
   - 8.8.8.8
+addresses:
+  portal.paxico.pk: 10.0.0.2
 queries:
   recache_ttl: 10
   upstream_strategy: parallel

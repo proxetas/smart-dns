@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"runtime"
 	"sort"
 	"strings"
@@ -100,7 +101,7 @@ func try_send_optimized(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNo
 					answers = append(answers, optimized_record.record)
 					write_response(resp, req, answers, nil, nil)
 					if optimizedRecordA, ok := optimized_record.record.(*dns.A); ok {
-						fmt.Printf("[%s] Q [%s] %s \t\t -> optimized response sent %s\n", remoteIP, getQTypeLabel(req.Question[0].Qtype), req.Question[0].Name, optimizedRecordA.A)
+						log_action(req, remoteIP, "optimized", optimizedRecordA.A.String())
 					}
 
 					return true, optimized_record
@@ -117,7 +118,7 @@ func try_send_optimized(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNo
 			answers := []dns.RR{optimized_record.record}
 			write_response(resp, req, answers, nil, nil)
 			if optimizedRecordA, ok := optimized_record.record.(*dns.A); ok {
-				fmt.Printf("[%s] Q [%s] %s \t\t -> optimized response sent %s\n", remoteIP, getQTypeLabel(req.Question[0].Qtype), req.Question[0].Name, optimizedRecordA.A)
+				log_action(req, remoteIP, "optimized", optimizedRecordA.A.String())
 			}
 			return true, optimized_record
 		}
@@ -140,6 +141,10 @@ func try_send_cached(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode,
 			if ok {
 				alias_cache := cache.GetCacheNode(cname.Target)
 				alias_records := alias_cache.GetRecords(req.Question[0].Qtype, cname.Target)
+				//we have a cname but no A record
+				if len(alias_records) == 0 {
+					return false, nil
+				}
 				records = append(records, alias_records...)
 			}
 		}
@@ -151,7 +156,7 @@ func try_send_cached(req *dns.Msg, resp dns.ResponseWriter, cache *DnsCacheNode,
 			rr_records = append(rr_records, record.record)
 		}
 		write_response(resp, req, rr_records, nil, nil)
-		fmt.Printf("[%s] Q [%s] %s \t\t -> cached response sent\n", remoteIP, getQTypeLabel(req.Question[0].Qtype), req.Question[0].Name)
+		log_action(req, remoteIP, "cached", getRRValue(rr_records[0]))
 		return true, records
 	}
 
@@ -179,14 +184,48 @@ func getQTypeLabel(qtype uint16) string {
 	}
 }
 
-func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, wg *sync.WaitGroup) {
+func log_action(req *dns.Msg, remoteIP string, responseType string, responseInfo string) {
+	question := req.Question[0]
+
+	log.Printf("[%s] Q [%s] %s -> %s :: %s", remoteIP, getQTypeLabel(question.Qtype), question.Name, responseType, responseInfo)
+}
+
+func try_predefined(req *dns.Msg, resp dns.ResponseWriter, config *Config) bool {
+	if entry, exists := config.Addresses[strings.TrimRight(req.Question[0].Name, ".")]; exists {
+		aRecord := &dns.A{
+			Hdr: dns.RR_Header{
+				Name:   req.Question[0].Name, // The domain name
+				Rrtype: dns.TypeA,            // A record type
+				Class:  dns.ClassINET,        // Internet class
+				Ttl:    3600,                 // Time to live in seconds
+			},
+			A: net.ParseIP(entry),
+		}
+		write_response(resp, req, []dns.RR{aRecord}, nil, nil)
+		return true
+	}
+
+	return false
+}
+
+func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, wg *sync.WaitGroup, requestLock *RequestLock) {
 	defer wg.Done()
 
 	for task := range tasks {
+		sentPredefined := try_predefined(task.request, task.writer, task.config)
+
+		if sentPredefined {
+			continue
+		}
+
 		cache := root.GetCacheNode(task.request.Question[0].Name)
+		requestKey := fmt.Sprintf("%d%s", task.request.Question[0].Qtype, task.request.Question[0].Name)
 		remoteIP := strings.Split(task.writer.RemoteAddr().String(), ":")[0]
+
+		requestLock.Lock(requestKey)
 		sentOptimized, optimizedRecord := try_send_optimized(task.request, task.writer, cache, remoteIP)
 		if sentOptimized && time.Until(optimizedRecord.expiration).Seconds() > float64(task.config.Queries.RecacheTTL) {
+			requestLock.Unlock(requestKey)
 			continue
 		}
 
@@ -206,6 +245,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 			}
 
 			if !needs_recache {
+				requestLock.Unlock(requestKey)
 				continue
 			}
 		}
@@ -215,6 +255,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 			if !task.request.RecursionDesired {
 				//TODO: implement authorative/zone
 				dns.HandleFailed(task.writer, task.request)
+				requestLock.Unlock(requestKey)
 				continue
 			}
 		}
@@ -232,7 +273,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 			if len(first.Answer) > 0 {
 				response_value = getRRValue(first.Answer[0])
 			}
-			fmt.Printf("[%s] Q [%s] %s \t\t -> proxied response sent %s\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name, response_value)
+			log_action(task.request, remoteIP, "proxied", response_value)
 		}
 
 		results := make([]*dns.Msg, 0, len(task.config.Nameservers)+1)
@@ -249,7 +290,7 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 				if !sentResponse {
 					task.writer.WriteMsg(result)
 					sentResponse = true
-					fmt.Printf("[%s] Q [%s] %s \t\t -> proxied response sent\n", remoteIP, getQTypeLabel(task.request.Question[0].Qtype), task.request.Question[0].Name)
+					log_action(task.request, remoteIP, "proxied", getRRValue(result.Answer[0]))
 				}
 
 				for _, answer := range result.Answer {
@@ -272,7 +313,8 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 
 		if !sentResponse {
 			dns.HandleFailed(task.writer, task.request)
-			fmt.Printf("Q from %s for %s \t -> failed", remoteIP, task.request.Question[0].Name)
+			log_action(task.request, remoteIP, "failed", "")
+			requestLock.Unlock(requestKey)
 			continue
 		}
 		var ARecords []*dns.A
@@ -296,6 +338,41 @@ func request_worker(tasks <-chan ResolveTask, hosts *Host, root *DnsCacheNode, w
 				cache.SetOptimizedRecord(fastSortedRecords[0])
 			}
 		}
+		requestLock.Unlock(requestKey)
+	}
+}
+
+type RequestLock struct {
+	lock     sync.Mutex
+	requests map[string]*sync.Mutex
+}
+
+func (r *RequestLock) Lock(key string) {
+	r.lock.Lock()
+	lock, exists := r.requests[key]
+	if !exists {
+		lock = &sync.Mutex{}
+		r.requests[key] = lock
+	}
+	r.lock.Unlock()
+
+	lock.Lock()
+}
+
+func (r *RequestLock) Unlock(key string) {
+	r.lock.Lock()
+	lock, exists := r.requests[key]
+	r.lock.Unlock()
+	if exists {
+		lock.Unlock()
+	} else {
+		fmt.Println("Unlocking non-existent key")
+	}
+}
+
+func NewRequestLock() *RequestLock {
+	return &RequestLock{
+		requests: make(map[string]*sync.Mutex),
 	}
 }
 
@@ -311,13 +388,14 @@ func main() {
 	var wg sync.WaitGroup
 	host := NewHost()
 	cache := NewDnsCacheNode(".")
+	requestLock := NewRequestLock()
 
 	//start 1 worker
 	workers := runtime.NumCPU() * 2
 	// workers := 1
 	for range workers {
 		wg.Add(1)
-		go request_worker(resolverTasks, host, cache, &wg)
+		go request_worker(resolverTasks, host, cache, &wg, requestLock)
 	}
 
 	log.Printf("spawned %d workers", workers)
